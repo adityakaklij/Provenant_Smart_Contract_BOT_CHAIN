@@ -474,9 +474,8 @@ contract ProvenantTest is Test {
     /// function body runs, so the explicit range check is never reached.
     function test_SetProjectStatus_RejectsOutOfRangeEnum() public {
         vm.prank(owner);
-        (bool ok,) = address(provenant).call(
-            abi.encodeWithSelector(provenant.setProjectStatus.selector, projectId, uint8(2))
-        );
+        (bool ok,) =
+            address(provenant).call(abi.encodeWithSelector(provenant.setProjectStatus.selector, projectId, uint8(2)));
         assertFalse(ok);
         assertEq(uint8(provenant.getProject(projectId).status), uint8(Provenant.ProjectStatus.Active));
     }
@@ -623,6 +622,34 @@ contract ProvenantTest is Test {
             provenant.updateProject(projectId, next, HASH_V1);
             assertEq(provenant.getProject(projectId).currentVersion, next);
         }
+    }
+
+    /// Anchoring type(uint64).max leaves no larger version, so every later
+    /// update reverts. A maintainer can do this too, not only the owner.
+    function test_UpdateProject_MaxVersionBlocksFurtherUpdates() public {
+        _addMaintainer(alice);
+
+        vm.prank(alice);
+        provenant.updateProject(projectId, type(uint64).max, HASH_V2);
+        assertEq(provenant.getProject(projectId).currentVersion, type(uint64).max);
+
+        vm.prank(owner);
+        vm.expectRevert(Provenant.InvalidVersion.selector);
+        provenant.updateProject(projectId, type(uint64).max, HASH_V1);
+
+        vm.prank(owner);
+        vm.expectRevert(Provenant.InvalidVersion.selector);
+        provenant.updateProject(projectId, 2, HASH_V1);
+    }
+
+    /// Same lock-out when the project is created at type(uint64).max.
+    function test_CreateProject_MaxVersionBlocksAllUpdates() public {
+        vm.prank(alice);
+        bytes32 id = provenant.createProject(bytes32(uint256(99)), "Maxed", type(uint64).max, HASH_V1);
+
+        vm.prank(alice);
+        vm.expectRevert(Provenant.InvalidVersion.selector);
+        provenant.updateProject(id, type(uint64).max, HASH_V2);
     }
 
     // ---------------------------------------------------------------------
