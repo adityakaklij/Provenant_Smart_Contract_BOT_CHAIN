@@ -6,6 +6,8 @@ pragma solidity ^0.8.24;
 /// project status, and verifiable event commitments.
 /// @dev Only hashes are stored; the canonical bytes live off-chain and are
 /// re-hashed by verifiers. Hashes are opaque bytes32 (the app uses SHA-256).
+/// An anchor proves a record existed unchanged at that block; it does not
+/// prove the record is current or true.
 /// Not upgradeable.
 contract Provenant {
     uint256 public constant MAX_NAME_LENGTH = 100;
@@ -19,9 +21,10 @@ contract Provenant {
         string name;
         address owner;
         address pendingOwner;
-        // Latest anchored off-chain manifest version. Not every off-chain
-        // version is anchored, so versions may have gaps.
-        uint64 currentVersion;
+        // Number of anchored manifests (the anchor counter, not the off-chain
+        // manifest version). 1 at creation, +1 per update, so anchors
+        // 1..anchorCount all exist.
+        uint64 anchorCount;
         ProjectStatus status;
         bool exists;
     }
@@ -41,8 +44,12 @@ contract Provenant {
     // Project ID => project details
     mapping(bytes32 => Project) private projects;
 
-    // Project ID => off-chain manifest version => manifest
+    // Project ID => anchor number => manifest
     mapping(bytes32 => mapping(uint64 => Manifest)) private manifests;
+
+    // Project ID => manifest hash => anchor number (0 = never anchored).
+    // Lets verifiers check a manifest by its hash alone, and blocks duplicates.
+    mapping(bytes32 => mapping(bytes32 => uint64)) public anchorOf;
 
     // Project ID => maintainer => authorization
     mapping(bytes32 => mapping(address => bool)) public isMaintainer;
@@ -57,9 +64,6 @@ contract Provenant {
     // Project ID => event ID => event details
     mapping(bytes32 => mapping(bytes32 => ProjectEvent)) private projectEvents;
 
-    // Project ID => event ID => existence
-    mapping(bytes32 => mapping(bytes32 => bool)) private eventExists;
-
     error ProjectAlreadyExists();
     error ProjectNotFound();
     error Unauthorized();
@@ -69,18 +73,16 @@ contract Provenant {
     error MaintainerAlreadyExists();
     error MaintainerNotFound();
     error EventAlreadyExists();
+    error ManifestAlreadyAnchored();
+    error NoPendingTransfer();
+    error EventNotFound();
 
     event ProjectCreated(
-        bytes32 indexed projectId,
-        address indexed owner,
-        bytes32 indexed salt,
-        string name,
-        uint64 version,
-        bytes32 initialManifestHash
+        bytes32 indexed projectId, address indexed owner, bytes32 indexed salt, string name, bytes32 initialManifestHash
     );
 
     event ProjectUpdated(
-        bytes32 indexed projectId, uint64 indexed version, bytes32 manifestHash, address indexed updatedBy
+        bytes32 indexed projectId, uint64 indexed anchorNumber, bytes32 manifestHash, address indexed updatedBy
     );
 
     event MaintainerUpdated(bytes32 indexed projectId, address indexed maintainer, bool authorized);
@@ -88,6 +90,8 @@ contract Provenant {
     event OwnershipTransferStarted(
         bytes32 indexed projectId, address indexed currentOwner, address indexed pendingOwner
     );
+
+    event OwnershipTransferCancelled(bytes32 indexed projectId, address indexed cancelledPendingOwner);
 
     event OwnershipTransferred(bytes32 indexed projectId, address indexed previousOwner, address indexed newOwner);
 
@@ -146,22 +150,20 @@ contract Provenant {
         return keccak256(abi.encode(creator, salt));
     }
 
-    /// @notice Register a new project with its first anchored manifest.
-    /// The caller becomes the owner.
+    /// @notice Register a new project with its first anchored manifest
+    /// (anchor 1). The caller becomes the owner.
     /// @dev The name is stored once and never updated on-chain; later
     /// renames are covered by the manifest hash.
     /// @param salt Off-chain project UUID (see computeProjectId). Non-zero.
     /// @param name Display name, 1 to MAX_NAME_LENGTH bytes.
-    /// @param version Off-chain manifest version being anchored. Non-zero;
-    /// need not be 1 if earlier versions were never anchored.
     /// @param initialManifestHash Hash of that manifest's canonical bytes.
     /// @return projectId computeProjectId(msg.sender, salt).
-    function createProject(bytes32 salt, string calldata name, uint64 version, bytes32 initialManifestHash)
+    function createProject(bytes32 salt, string calldata name, bytes32 initialManifestHash)
         external
         returns (bytes32 projectId)
     {
         if (
-            salt == bytes32(0) || version == 0 || initialManifestHash == bytes32(0) || bytes(name).length == 0
+            salt == bytes32(0) || initialManifestHash == bytes32(0) || bytes(name).length == 0
                 || bytes(name).length > MAX_NAME_LENGTH
         ) {
             revert InvalidInput();
@@ -177,44 +179,52 @@ contract Provenant {
             name: name,
             owner: msg.sender,
             pendingOwner: address(0),
-            currentVersion: version,
+            anchorCount: 1,
             status: ProjectStatus.Active,
             exists: true
         });
 
-        manifests[projectId][version] = Manifest({contentHash: initialManifestHash, timestamp: uint64(block.timestamp)});
+        manifests[projectId][1] = Manifest({contentHash: initialManifestHash, timestamp: uint64(block.timestamp)});
+        anchorOf[projectId][initialManifestHash] = 1;
 
-        emit ProjectCreated(projectId, msg.sender, salt, name, version, initialManifestHash);
+        emit ProjectCreated(projectId, msg.sender, salt, name, initialManifestHash);
     }
 
-    /// @notice Anchor a newer off-chain manifest version.
+    /// @notice Anchor a new manifest as the next anchor number.
     /// Owner or maintainer only; project must be active.
-    /// @dev Versions must strictly increase but may skip (only major updates
-    /// are anchored). This also rejects stale or duplicate submissions.
+    /// @dev The contract assigns the anchor number (anchorCount + 1), so
+    /// callers cannot skip ahead or exhaust the number space. Each hash can be
+    /// anchored once per project; this relies on every off-chain manifest
+    /// embedding its own version and previous_manifest_hash, so only a
+    /// resubmission repeats a hash. Anchors need not arrive in off-chain
+    /// order; the off-chain version is inside the hashed manifest.
     /// @param projectId Project to update.
-    /// @param version Off-chain manifest version; must be > currentVersion.
-    /// @param manifestHash Hash of that manifest's canonical bytes. Non-zero.
-    function updateProject(bytes32 projectId, uint64 version, bytes32 manifestHash)
+    /// @param manifestHash Hash of the manifest's canonical bytes. Non-zero.
+    /// @return anchorNumber The anchor number assigned to this manifest.
+    function updateProject(bytes32 projectId, bytes32 manifestHash)
         external
         projectExists(projectId)
         onlyPublisher(projectId)
         onlyActive(projectId)
+        returns (uint64 anchorNumber)
     {
         if (manifestHash == bytes32(0)) {
             revert InvalidInput();
         }
 
-        Project storage project = projects[projectId];
-
-        if (version <= project.currentVersion) {
-            revert InvalidVersion();
+        if (anchorOf[projectId][manifestHash] != 0) {
+            revert ManifestAlreadyAnchored();
         }
 
-        project.currentVersion = version;
+        Project storage project = projects[projectId];
 
-        manifests[projectId][version] = Manifest({contentHash: manifestHash, timestamp: uint64(block.timestamp)});
+        anchorNumber = project.anchorCount + 1;
+        project.anchorCount = anchorNumber;
 
-        emit ProjectUpdated(projectId, version, manifestHash, msg.sender);
+        manifests[projectId][anchorNumber] = Manifest({contentHash: manifestHash, timestamp: uint64(block.timestamp)});
+        anchorOf[projectId][manifestHash] = anchorNumber;
+
+        emit ProjectUpdated(projectId, anchorNumber, manifestHash, msg.sender);
     }
 
     /// @notice Add a maintainer. Only the project owner can do this.
@@ -252,29 +262,11 @@ contract Provenant {
         projectExists(projectId)
         onlyOwner(projectId)
     {
-        uint256 indexPlusOne = maintainerIndexPlusOne[projectId][maintainer];
-
-        if (indexPlusOne == 0) {
+        if (!isMaintainer[projectId][maintainer]) {
             revert MaintainerNotFound();
         }
 
-        address[] storage list = maintainers[projectId];
-        uint256 index = indexPlusOne - 1;
-        uint256 lastIndex = list.length - 1;
-
-        if (index != lastIndex) {
-            address lastMaintainer = list[lastIndex];
-
-            list[index] = lastMaintainer;
-            maintainerIndexPlusOne[projectId][lastMaintainer] = index + 1;
-        }
-
-        list.pop();
-
-        delete maintainerIndexPlusOne[projectId][maintainer];
-        isMaintainer[projectId][maintainer] = false;
-
-        emit MaintainerUpdated(projectId, maintainer, false);
+        _removeMaintainer(projectId, maintainer);
     }
 
     /// @notice Begin a two-step ownership transfer. Only the owner can do this.
@@ -294,6 +286,22 @@ contract Provenant {
         projects[projectId].pendingOwner = newOwner;
 
         emit OwnershipTransferStarted(projectId, msg.sender, newOwner);
+    }
+
+    /// @notice Cancel a pending ownership transfer. Only the owner can do this.
+    /// @dev Use when the transfer was started to a wrong or compromised address.
+    /// @param projectId Project whose pending transfer is cancelled.
+    function cancelOwnershipTransfer(bytes32 projectId) external projectExists(projectId) onlyOwner(projectId) {
+        Project storage project = projects[projectId];
+        address pending = project.pendingOwner;
+
+        if (pending == address(0)) {
+            revert NoPendingTransfer();
+        }
+
+        project.pendingOwner = address(0);
+
+        emit OwnershipTransferCancelled(projectId, pending);
     }
 
     /// @notice Accept a pending ownership transfer. Only the pending owner
@@ -333,7 +341,7 @@ contract Provenant {
     {
         Project storage project = projects[projectId];
 
-        if (newStatus == project.status || uint8(newStatus) > uint8(ProjectStatus.Archived)) {
+        if (newStatus == project.status) {
             revert InvalidStatus();
         }
 
@@ -360,11 +368,10 @@ contract Provenant {
             revert InvalidInput();
         }
 
-        if (eventExists[projectId][eventId]) {
+        // eventHash is non-zero, so a stored event always has a non-zero contentHash.
+        if (projectEvents[projectId][eventId].contentHash != bytes32(0)) {
             revert EventAlreadyExists();
         }
-
-        eventExists[projectId][eventId] = true;
 
         projectEvents[projectId][eventId] = ProjectEvent({
             eventType: eventType, contentHash: eventHash, submittedBy: msg.sender, timestamp: uint64(block.timestamp)
@@ -375,7 +382,7 @@ contract Provenant {
 
     /// @notice Read the current project record.
     /// @param projectId Project to read.
-    /// @return Name, owner, pending owner, latest anchored version, status.
+    /// @return Name, owner, pending owner, anchor count, status.
     function getProject(bytes32 projectId) external view projectExists(projectId) returns (Project memory) {
         return projects[projectId];
     }
@@ -387,19 +394,20 @@ contract Provenant {
         return maintainers[projectId];
     }
 
-    /// @notice Read an anchored manifest version.
-    /// @dev Reverts with InvalidVersion for versions that were never anchored.
+    /// @notice Read an anchored manifest by its anchor number.
+    /// @dev Reverts with InvalidVersion outside 1..anchorCount. To find the
+    /// anchor number for a hash, use anchorOf.
     /// @param projectId Project to read.
-    /// @param version Off-chain manifest version.
+    /// @param anchorNumber Anchor number, 1..anchorCount.
     /// @return contentHash Anchored hash of the manifest's canonical bytes.
     /// @return timestamp Block time when it was anchored.
-    function getManifest(bytes32 projectId, uint64 version)
+    function getManifest(bytes32 projectId, uint64 anchorNumber)
         external
         view
         projectExists(projectId)
         returns (bytes32 contentHash, uint64 timestamp)
     {
-        Manifest storage manifest = manifests[projectId][version];
+        Manifest storage manifest = manifests[projectId][anchorNumber];
 
         if (manifest.contentHash == bytes32(0)) {
             revert InvalidVersion();
@@ -409,7 +417,7 @@ contract Provenant {
     }
 
     /// @notice Read a previously anchored event.
-    /// @dev Reverts with InvalidInput if the event was never anchored.
+    /// @dev Reverts with EventNotFound if the event was never anchored.
     /// @param projectId Project the event belongs to.
     /// @param eventId Off-chain event ID used in anchorEvent.
     /// @return eventType keccak256 label of the event type.
@@ -422,17 +430,17 @@ contract Provenant {
         projectExists(projectId)
         returns (bytes32 eventType, bytes32 contentHash, address submittedBy, uint64 timestamp)
     {
-        if (!eventExists[projectId][eventId]) {
-            revert InvalidInput();
-        }
-
         ProjectEvent storage projectEvent = projectEvents[projectId][eventId];
+
+        if (projectEvent.contentHash == bytes32(0)) {
+            revert EventNotFound();
+        }
 
         return (projectEvent.eventType, projectEvent.contentHash, projectEvent.submittedBy, projectEvent.timestamp);
     }
 
-    /// @dev Swap-and-pop removal used by acceptOwnership. No-op if
-    /// `maintainer` is not in the list.
+    /// @dev Swap-and-pop removal shared by removeMaintainer and acceptOwnership.
+    /// No-op if `maintainer` is not in the list.
     function _removeMaintainer(bytes32 projectId, address maintainer) internal {
         uint256 indexPlusOne = maintainerIndexPlusOne[projectId][maintainer];
 
